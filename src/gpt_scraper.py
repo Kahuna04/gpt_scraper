@@ -1,3 +1,4 @@
+"""Automate interactions with ChatGPT using Selenium"""
 import os
 import time
 import csv
@@ -7,6 +8,7 @@ import tempfile
 import shutil
 import getpass
 import requests
+import sys
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -46,7 +48,7 @@ class ChatGPTScraper:
     Logs in, sends prompts, collects responses, and exports data to CSV.
     """
 
-    def __init__(self, headless=False, logger=None):
+    def __init__(self, headless=False, logger=None, use_specific_driver=None):
         self.logger = logger or logging.getLogger(__name__)
         self.logger.info("Initializing ChatGPT scraper")
 
@@ -70,12 +72,42 @@ class ChatGPTScraper:
 
         try:
             self.logger.info("Setting up Chrome driver using undetected_chromedriver")
-            self.driver = uc.Chrome(options=options)
+            
+            # Try different initialization approaches
+            if use_specific_driver:
+                self.logger.info(f"Using specific Chrome driver path: {use_specific_driver}")
+                self.driver = uc.Chrome(driver_executable_path=use_specific_driver, options=options)
+            else:
+                try:
+                    # First attempt: Try with version_main parameter set to the user's Chrome version
+                    try:
+                        # Try to detect Chrome version
+                        from selenium.webdriver.chrome.service import Service
+                        from webdriver_manager.chrome import ChromeDriverManager
+                        from selenium import webdriver
+                        
+                        temp_options = webdriver.ChromeOptions()
+                        temp_options.add_argument('--headless=new')
+                        temp_service = Service(ChromeDriverManager().install())
+                        temp_driver = webdriver.Chrome(service=temp_service, options=temp_options)
+                        chrome_version = temp_driver.capabilities['browserVersion'].split('.')[0]
+                        temp_driver.quit()
+                        
+                        self.logger.info(f"Detected Chrome version: {chrome_version}")
+                        self.driver = uc.Chrome(version_main=int(chrome_version), options=options)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to detect Chrome version: {e}")
+                        # Fall back to default behavior
+                        self.driver = uc.Chrome(options=options)
+                except Exception as e:
+                    self.logger.warning(f"First initialization attempt failed: {e}")
+                    # Second attempt: Try with no custom parameters
+                    self.driver = uc.Chrome(options=options)
 
             # Minimize the window if not in headless mode
             if not headless:
                 self.logger.info("Minimizing browser window")
-                self.driver.minimize_window
+                self.driver.minimize_window()
 
             # Set timeouts
             self.driver.set_page_load_timeout(30)
@@ -85,6 +117,17 @@ class ChatGPTScraper:
 
         except Exception as e:
             self.logger.error(f"Failed to initialize Chrome driver: {e}")
+            self.logger.info("Providing troubleshooting advice...")
+            print("\n========== TROUBLESHOOTING ADVICE ==========")
+            print("Chrome version mismatch detected. You can try these solutions:")
+            print("1. Update your Chrome browser to the latest version")
+            print("2. Install ChromeDriver that matches your Chrome version from:")
+            print("   https://chromedriver.chromium.org/downloads")
+            print("3. Run the script with --chrome-driver parameter pointing to your ChromeDriver")
+            print("   Example: python script.py --chrome-driver /path/to/chromedriver")
+            print("4. Or try installing a specific version of undetected-chromedriver:")
+            print("   pip install undetected-chromedriver==VERSION")
+            print("===========================================\n")
             raise
 
         self.session = requests.Session()
@@ -101,6 +144,15 @@ class ChatGPTScraper:
                 time.sleep(10)
                 self.logger.debug("Page loaded, waiting 10 seconds")
 
+                # Check for the current URL to see if we need to login
+                current_url = self.driver.current_url
+                self.logger.debug(f"Current URL: {current_url}")
+                
+                # If we're already at the chat page, we might be logged in
+                if "https://chat.openai.com/c/" in current_url:
+                    self.logger.info("Already logged in and at chat page")
+                    return True
+                
                 # Click the Log in button
                 self.logger.info("Looking for login button")
                 login_button = WebDriverWait(self.driver, 30).until(
@@ -153,11 +205,19 @@ class ChatGPTScraper:
                 submit_button.click()
                 self.logger.info("Clicked continue after password")
 
-                # Wait for the chat interface to load
+                # Wait for the chat interface to load (try different selectors)
                 self.logger.info("Waiting for chat interface to load")
-                WebDriverWait(self.driver, 30).until(
-                    EC.visibility_of_element_located((By.XPATH, "/html/body/div[1]/div/div[1]/div[2]/main/div[1]/div[2]/div/div/div/div/div[1]/div/div/div"))
-                )
+                try:
+                    # Try the original selector
+                    WebDriverWait(self.driver, 30).until(
+                        EC.visibility_of_element_located((By.XPATH, "/html/body/div[1]/div/div[1]/div[2]/main/div[1]/div[2]/div/div/div/div/div[1]/div/div/div"))
+                    )
+                except TimeoutException:
+                    # Try an alternative selector for the chat interface
+                    WebDriverWait(self.driver, 30).until(
+                        EC.visibility_of_element_located((By.CSS_SELECTOR, "div[data-testid='chat-history']"))
+                    )
+                
                 self.logger.info("Successfully logged in! Chat interface loaded.")
 
                 # Additional delay to ensure everything is fully loaded
@@ -203,11 +263,18 @@ class ChatGPTScraper:
                 existing_responses = len(self.driver.find_elements(By.CSS_SELECTOR, "div.markdown"))
                 self.logger.debug(f"Found {existing_responses} existing responses before sending prompt")
 
-                # Find the input field and send the prompt
+                # Find the input field and send the prompt - try multiple selectors
                 self.logger.info("Looking for input textbox")
-                input_field = WebDriverWait(self.driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "div#prompt-textarea"))
-                )
+                try:
+                    input_field = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "div#prompt-textarea"))
+                    )
+                except TimeoutException:
+                    self.logger.info("First selector failed, trying alternative input selector")
+                    input_field = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "textarea[data-testid='chat-compose-textarea']"))
+                    )
+                
                 input_field.clear()
                 self.logger.debug("Input field cleared")
 
@@ -218,11 +285,18 @@ class ChatGPTScraper:
                     time.sleep(0.01)
                 self.logger.debug("Finished typing prompt")
 
-                # Click the send button
+                # Click the send button - try multiple selectors
                 self.logger.info("Looking for send button")
-                send_button = WebDriverWait(self.driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-testid='send-button']"))
-                )
+                try:
+                    send_button = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-testid='send-button']"))
+                    )
+                except TimeoutException:
+                    self.logger.info("First send button selector failed, trying alternative")
+                    send_button = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "button[aria-label='Send message']"))
+                    )
+                
                 send_button.click()
                 self.logger.info("Prompt sent, waiting for response")
 
@@ -236,13 +310,28 @@ class ChatGPTScraper:
                 WebDriverWait(self.driver, wait_timeout).until(response_count_increased)
                 self.logger.info("New response detected")
                 
-                # Wait for the response to complete
+                # Wait for the response to complete - try different indicators
                 self.logger.info("Waiting for response to complete...")
-                speech_button_selector = "button[data-testid='composer-speech-button']"
-                WebDriverWait(self.driver, wait_timeout).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, speech_button_selector))
-                )
-                self.logger.info("Composer speech button found - response is complete")
+                try:
+                    # Try original speech button selector
+                    speech_button_selector = "button[data-testid='composer-speech-button']"
+                    WebDriverWait(self.driver, wait_timeout).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, speech_button_selector))
+                    )
+                    self.logger.info("Composer speech button found - response is complete")
+                except TimeoutException:
+                    # Try alternative ways to detect completion
+                    self.logger.info("Speech button not found, trying alternative completion detection")
+                    # Wait for regenerate/stop generating button to disappear
+                    try:
+                        WebDriverWait(self.driver, wait_timeout).until_not(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, "button[data-testid='stop-generating-button']"))
+                        )
+                        self.logger.info("Stop generating button disappeared - response is complete")
+                    except TimeoutException:
+                        # Just wait a bit longer and assume completion
+                        self.logger.warning("Could not detect completion explicitly, waiting additional time")
+                        time.sleep(wait_timeout / 2)
 
                 # Small additional delay to ensure response is fully rendered
                 time.sleep(2)
@@ -366,9 +455,27 @@ def main():
     parser.add_argument('--headless', action='store_true', help='Run browser in headless mode')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--wait-timeout', type=int, default=120, help='Timeout in seconds to wait for response completion')
+    parser.add_argument('--chrome-driver', type=str, help='Path to specific ChromeDriver executable')
+    parser.add_argument('--install-deps', action='store_true', help='Install or update necessary dependencies')
 
     args = parser.parse_args()
     logger.info(f"Command line arguments processed")
+
+    # Handle dependencies installation if requested
+    if args.install_deps:
+        logger.info("Installing/updating dependencies")
+        print("Installing/updating necessary dependencies...")
+        try:
+            import pip
+            pip.main(['install', '--upgrade', 'undetected-chromedriver'])
+            pip.main(['install', '--upgrade', 'selenium'])
+            pip.main(['install', '--upgrade', 'webdriver-manager'])
+            pip.main(['install', '--upgrade', 'python-dotenv'])
+            print("Dependencies installed/updated successfully.")
+        except Exception as e:
+            logger.error(f"Error installing dependencies: {e}")
+            print(f"Error installing dependencies: {e}")
+            sys.exit(1)
 
     if args.debug:
         # Set log level to DEBUG if --debug flag is provided
@@ -382,11 +489,13 @@ def main():
     if not email:
         logger.info("Email not provided via arguments or environment, prompting user")
         email = input("Enter your email: ")
+        os.environ['EMAIL'] = email
 
     password = args.password or os.getenv('PASSWORD')
     if not password:
         logger.info("Password not provided via arguments or environment, prompting user")
         password = getpass.getpass("Enter your password: ")
+        os.environ['PASSWORD'] = password
 
     initial_prompt = args.prompt
     if not initial_prompt:
@@ -402,7 +511,8 @@ def main():
         logger.info("Creating ChatGPTScraper instance")
         scraper = ChatGPTScraper(
             headless=headless_mode, 
-            logger=logger
+            logger=logger,
+            use_specific_driver=args.chrome_driver
         )
 
         # Login
@@ -424,19 +534,22 @@ def main():
                 reply_prompt = args.reply
                 if not reply_prompt:
                     logger.info("Reply prompt not provided via arguments, prompting user")
-                    reply_prompt = input("Enter your reply prompt: ")
+                    reply_prompt = input("Enter your reply prompt (or press Enter to skip): ")
 
-                # Send reply prompt
-                logger.info("Sending reply prompt")
-                reply_response = scraper.send_prompt(reply_prompt, max_retries=2, wait_timeout=args.wait_timeout)
-                if reply_response:
-                    logger.info("Received response to reply prompt")
-                    print("\nChatGPT Response to Reply:")
-                    print("="*50)
-                    print(reply_response)
-                    print("="*50)
+                if reply_prompt:
+                    # Send reply prompt
+                    logger.info("Sending reply prompt")
+                    reply_response = scraper.send_prompt(reply_prompt, max_retries=2, wait_timeout=args.wait_timeout)
+                    if reply_response:
+                        logger.info("Received response to reply prompt")
+                        print("\nChatGPT Response to Reply:")
+                        print("="*50)
+                        print(reply_response)
+                        print("="*50)
+                    else:
+                        logger.warning("No response received to reply prompt")
                 else:
-                    logger.warning("No response received to reply prompt")
+                    logger.info("Reply prompt skipped")
             else:
                 logger.warning("No response received to initial prompt")
 
